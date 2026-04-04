@@ -1,0 +1,27 @@
+[run]
+url = ""
+max_pages = 12
+max_recipes = 3
+translate_fr = true
+push_notion = true
+output = ""
+output_dir = ""
+json = false
+
+[notion]
+token_env = "NOTION_TOKEN"
+database_url = "https://www.notion.so/your-workspace/your-database-id?v=your-view-id"
+notion_version = "2026-03-11"
+include_markdown_block = false
+use_recipe_image_as_cover = true
+
+[notion.properties]
+title = "Nom"
+description = "Description"
+source_url = "Source"
+author = "Auteur"
+yields = "Portions"
+total_time = "Temps total"
+prep_time = "Temps préparation"
+cook_time = "Temps de cuisson"
+site_name = "Site"

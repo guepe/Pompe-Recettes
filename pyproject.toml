@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pompe-recettes"
+version = "0.1.0"
+description = "Extract cooking recipes from supported websites and export them as Markdown for Notion."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "deep-translator>=1.11.4",
+  "recipe-scrapers>=15.11.0",
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+pompe-recettes = "pompe_recettes.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

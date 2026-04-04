@@ -1,0 +1,2 @@
+"""Pompe Recettes package."""
+
