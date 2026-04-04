@@ -316,7 +316,7 @@ def build_recipe_blocks(recipe: Recipe, include_markdown_block: bool = False) ->
         blocks.append(paragraph_block(recipe.description))
 
     blocks.append(heading_block("Ingrédients", level=2))
-    blocks.extend(to_do_block(item) for item in recipe.ingredients if item.strip())
+    blocks.extend(bulleted_list_block(item) for item in recipe.ingredients if item.strip())
 
     blocks.append(heading_block("Étapes", level=2))
     blocks.extend(numbered_list_block(step) for step in recipe.instructions if step.strip())
@@ -348,11 +348,11 @@ def heading_block(text: str, level: int = 2) -> dict[str, Any]:
     }
 
 
-def to_do_block(text: str) -> dict[str, Any]:
+def bulleted_list_block(text: str) -> dict[str, Any]:
     return {
         "object": "block",
-        "type": "to_do",
-        "to_do": {"checked": False, "rich_text": build_rich_text(text)},
+        "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": build_rich_text(text)},
     }
 
 

@@ -199,7 +199,7 @@ Supported export content:
 - times
 - recipe cover image
 - site name
-- ingredient checklist
+- ingredient bullet list
 - recipe steps
 
 The recipe source URL is also used as the duplicate-prevention key during Notion export when the target database has a compatible `url` or `rich_text` property mapped to `source_url`.
