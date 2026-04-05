@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urllib.request import Request, urlopen
+import requests
 
 
 DEFAULT_HEADERS = {
@@ -13,8 +13,13 @@ DEFAULT_HEADERS = {
 }
 
 
-def fetch_html(url: str, timeout: int = 20) -> str:
-    request = Request(url, headers=DEFAULT_HEADERS)
-    with urlopen(request, timeout=timeout) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+SESSION = requests.Session()
+SESSION.headers.update(DEFAULT_HEADERS)
+
+
+def fetch_html(url: str, timeout: int = 10) -> str:
+    response = SESSION.get(url, timeout=timeout)
+    response.raise_for_status()
+    if not response.encoding:
+        response.encoding = response.apparent_encoding or "utf-8"
+    return response.text

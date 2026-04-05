@@ -36,7 +36,7 @@ This project focuses on that full workflow:
 - Push recipes directly to a Notion database
 - Use a global project config instead of repeating CLI arguments
 - Add site-specific extraction fallbacks for unsupported websites
-- Support `colruyt.be` through a custom override layer
+- Support local overrides for `colruyt.be`, `equifrais.be`, `sofiedumont.fr`, `visitwallonia.be`, `giallozafferano.com`, and `katieparla.com`
 
 ## Project Layout
 
@@ -107,6 +107,8 @@ Example:
 url = "https://anitalianinmykitchen.com/category/ingredient/pasta-2/"
 max_pages = 12
 max_recipes = 3
+crawl_workers = 4
+request_timeout = 10
 translate_fr = true
 push_notion = true
 output = ""
@@ -135,6 +137,12 @@ Basic:
 
 ```bash
 pompe-recettes "https://anitalianinmykitchen.com/category/ingredient/pasta-2/"
+```
+
+Faster crawling for large hubs:
+
+```bash
+pompe-recettes "https://www.sofiedumont.fr/pages/recettes-cuisine-belge" --workers 6 --request-timeout 8
 ```
 
 Use another config file:
@@ -272,8 +280,17 @@ When `recipe-scrapers` does not support a website, this project can provide a lo
 That is currently the case for:
 
 - `colruyt.be`
+- `equifrais.be`
+- `sofiedumont.fr`
+- `visitwallonia.be`
+- `giallozafferano.com`
+- `katieparla.com`
 
-The Colruyt implementation uses the structured `Recipe` JSON-LD present in the page, which makes it more robust than scraping fragile visual selectors.
+Depending on the website, the override can use:
+
+- structured `Recipe` JSON-LD when it exists
+- site-specific recipe-hub link discovery
+- DOM parsing for editorial recipe pages that do not expose a clean recipe schema
 
 For a broader support overview, see [`SUPPORTED_SITES.md`](./SUPPORTED_SITES.md), which links to the official `recipe-scrapers` supported-sites list and documents local overrides handled by this project.
 
@@ -286,6 +303,12 @@ The current CLI behavior is intentionally opinionated:
 - global config is read from `config/project.toml`
 
 You can still disable those defaults with CLI flags when needed.
+
+For large category pages, the two most useful knobs are:
+
+- `max_pages` to control how much discovery work is allowed
+- `crawl_workers` / `--workers` to fetch multiple pages in parallel
+- `request_timeout` / `--request-timeout` to avoid waiting too long on slow pages
 
 ## Limitations
 

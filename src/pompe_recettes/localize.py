@@ -103,8 +103,36 @@ FRENCH_GLOSSARY = {
     "enjoy": "bon appétit",
 }
 
+FRENCH_SOURCE_SITES = {
+    "colruyt.be",
+    "equifrais.be",
+    "sofiedumont.fr",
+    "visitwallonia.be",
+}
 
-def localize_recipe(recipe: Recipe, translate_to_french: bool) -> Recipe:
+
+def localize_recipe(
+    recipe: Recipe, translate_to_french: bool, force_translation: bool = False
+) -> Recipe:
+    should_translate = translate_to_french and (
+        force_translation or recipe.site_name not in FRENCH_SOURCE_SITES
+    )
+
+    ingredient_texts = localize_texts(
+        recipe.ingredients,
+        translate=should_translate,
+        text_kind="ingredient",
+    )
+    instruction_texts = localize_texts(
+        recipe.instructions,
+        translate=should_translate,
+        text_kind="instruction",
+    )
+    title_text = localize_text(recipe.title, translate=should_translate, text_kind="title")
+    description_text = localize_text(
+        recipe.description, translate=should_translate, text_kind="description"
+    )
+
     localized = Recipe(
         title=recipe.title,
         source_url=recipe.source_url,
@@ -115,24 +143,13 @@ def localize_recipe(recipe: Recipe, translate_to_french: bool) -> Recipe:
         prep_time=recipe.prep_time,
         cook_time=recipe.cook_time,
         image=recipe.image,
-        ingredients=[
-            localize_text(item, translate=translate_to_french, text_kind="ingredient")
-            for item in recipe.ingredients
-        ],
-        instructions=[
-            localize_text(item, translate=translate_to_french, text_kind="instruction")
-            for item in recipe.instructions
-        ],
+        ingredients=ingredient_texts,
+        instructions=instruction_texts,
         site_name=recipe.site_name,
     )
 
-    localized.title = (
-        localize_text(recipe.title, translate=translate_to_french, text_kind="title")
-        or recipe.title
-    )
-    localized.description = localize_text(
-        recipe.description, translate=translate_to_french, text_kind="description"
-    )
+    localized.title = title_text or recipe.title
+    localized.description = description_text
     return localized
 
 
@@ -147,12 +164,47 @@ def localize_text(text: str | None, translate: bool, text_kind: str) -> str | No
     return postprocess_french_text(translated, text_kind=text_kind)
 
 
+def localize_texts(texts: list[str], translate: bool, text_kind: str) -> list[str]:
+    normalized_texts = [
+        SERVINGS_PATTERN.sub("portions", normalize_units(text))
+        for text in texts
+        if text
+    ]
+    if not translate:
+        return [postprocess_french_text(text, text_kind=text_kind) for text in normalized_texts]
+
+    translated_texts = translate_texts(normalized_texts)
+    return [postprocess_french_text(text, text_kind=text_kind) for text in translated_texts]
+
+
 @lru_cache(maxsize=256)
 def translate_text(text: str) -> str:
     try:
-        return GoogleTranslator(source="auto", target="fr").translate(text)
+        return _get_translator().translate(text)
     except Exception:
         return text
+
+
+def translate_texts(texts: list[str]) -> list[str]:
+    if not texts:
+        return []
+
+    unique_texts = list(dict.fromkeys(texts))
+    try:
+        translated_batch = _get_translator().translate_batch(unique_texts)
+    except Exception:
+        translated_batch = [translate_text(text) for text in unique_texts]
+
+    translated_map = {
+        source: (translated or source)
+        for source, translated in zip(unique_texts, translated_batch, strict=False)
+    }
+    return [translated_map.get(text, text) for text in texts]
+
+
+@lru_cache(maxsize=1)
+def _get_translator() -> GoogleTranslator:
+    return GoogleTranslator(source="auto", target="fr")
 
 
 def normalize_units(text: str) -> str:

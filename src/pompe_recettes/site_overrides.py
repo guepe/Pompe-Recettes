@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from pompe_recettes.models import Recipe
 
@@ -13,23 +14,190 @@ def extract_site_recipe(url: str, html: str) -> Recipe | None:
     host = urlparse(url).netloc.replace("www.", "")
     if host == "colruyt.be":
         return extract_colruyt_recipe(url, html)
+    if host == "sofiedumont.fr":
+        return extract_sofiedumont_recipe(url, html)
+    if host == "visitwallonia.be":
+        return extract_visitwallonia_recipe(url, html)
+    if host == "giallozafferano.com":
+        return extract_giallozafferano_recipe(url, html)
+    if host == "katieparla.com":
+        return extract_katieparla_recipe(url, html)
+    if host == "equifrais.be":
+        return extract_equifrais_recipe(url, html)
     return None
 
 
+def find_site_candidate_links(url: str, html: str) -> list[str]:
+    host = urlparse(url).netloc.replace("www.", "")
+    if host == "sofiedumont.fr":
+        return find_sofiedumont_links(url, html)
+    if host == "visitwallonia.be":
+        return find_visitwallonia_links(url, html)
+    if host == "equifrais.be":
+        return find_equifrais_links(url, html)
+    return []
+
+
 def extract_colruyt_recipe(url: str, html: str) -> Recipe | None:
+    return extract_recipe_from_ld_json(url, html, site_name="colruyt.be")
+
+
+def extract_sofiedumont_recipe(url: str, html: str) -> Recipe | None:
+    return extract_recipe_from_ld_json(url, html, site_name="sofiedumont.fr")
+
+
+def extract_giallozafferano_recipe(url: str, html: str) -> Recipe | None:
+    return extract_recipe_from_ld_json(url, html, site_name="giallozafferano.com")
+
+
+def extract_recipe_from_ld_json(url: str, html: str, site_name: str) -> Recipe | None:
     soup = BeautifulSoup(html, "html.parser")
     for script in soup.select('script[type="application/ld+json"]'):
         payload = _load_json(script.string or script.get_text())
         recipe_data = _find_recipe_payload(payload)
         if recipe_data is None:
             continue
-        recipe = _recipe_from_ld_json(url, recipe_data)
+        recipe = _recipe_from_ld_json(url, recipe_data, site_name=site_name)
         if recipe is not None:
             return recipe
     return None
 
 
-def _recipe_from_ld_json(url: str, payload: dict[str, Any]) -> Recipe | None:
+def extract_visitwallonia_recipe(url: str, html: str) -> Recipe | None:
+    soup = BeautifulSoup(html, "html.parser")
+    article = soup.select_one("article.node.node-page-contenu")
+    if article is None:
+        return None
+
+    title_node = soup.select_one("h1.header--banner--title")
+    title = _text(title_node.get_text(" ", strip=True)) if title_node else None
+
+    description = _extract_visitwallonia_description(article)
+    image = None
+    image_node = soup.select_one(".header--banner--picture img")
+    if image_node is not None:
+        image = _normalize_image_url(url, image_node.get("src"))
+
+    prep_time, yields = _extract_visitwallonia_meta(article)
+    ingredients = _extract_visitwallonia_list(article, "Ce qu'il vous faut", "ul")
+    instructions = _extract_visitwallonia_list(article, "À vous de jouer", "ol")
+
+    if not title or not ingredients or not instructions:
+        return None
+
+    author = "Julien Lapraille" if description and "Julien Lapraille" in description else None
+    return Recipe(
+        title=title,
+        source_url=url,
+        author=author,
+        description=description,
+        yields=yields,
+        total_time=prep_time,
+        prep_time=prep_time,
+        image=image,
+        ingredients=ingredients,
+        instructions=instructions,
+        site_name="visitwallonia.be",
+    )
+
+
+def extract_katieparla_recipe(url: str, html: str) -> Recipe | None:
+    soup = BeautifulSoup(html, "html.parser")
+    content = soup.select_one(".blog-single-content")
+    if content is None:
+        return None
+
+    title = _extract_katie_title(soup)
+    ingredients_heading = content.find(
+        lambda tag: tag.name == "p" and _clean_katie_text(tag.get_text(" ", strip=True)) == "Ingredients"
+    )
+    if ingredients_heading is None:
+        return None
+
+    ingredients: list[str] = []
+    instructions: list[str] = []
+    current_heading: str | None = None
+
+    for sibling in ingredients_heading.next_siblings:
+        if not isinstance(sibling, Tag):
+            continue
+        if sibling.name in {"h2", "h3"}:
+            break
+
+        text = _clean_katie_text(sibling.get_text(" ", strip=True))
+        if not text:
+            continue
+
+        if sibling.name == "ul":
+            items = [
+                _clean_katie_text(item.get_text(" ", strip=True))
+                for item in sibling.select("li")
+                if _clean_katie_text(item.get_text(" ", strip=True))
+            ]
+            if not ingredients:
+                ingredients = items
+            elif current_heading:
+                instructions.extend(f"{current_heading}: {item}" for item in items)
+            else:
+                instructions.extend(items)
+            continue
+
+        if sibling.name == "p":
+            lowered = text.lower().rstrip(":")
+            if lowered in {"share this post", "categories"}:
+                break
+            current_heading = text.rstrip(":")
+
+    if not title or not ingredients or not instructions:
+        return None
+
+    description = _extract_meta_content(soup, "name", "description")
+    image = _extract_meta_content(soup, "property", "og:image")
+    author = None
+    article_payload = _extract_article_payload(soup)
+    if article_payload is not None:
+        author_value = article_payload.get("author")
+        if isinstance(author_value, dict):
+            author = _text(author_value.get("name"))
+        else:
+            author = _text(author_value)
+
+    return Recipe(
+        title=title,
+        source_url=url,
+        author=author,
+        description=description,
+        image=image,
+        ingredients=ingredients,
+        instructions=instructions,
+        site_name="katieparla.com",
+    )
+
+
+def find_sofiedumont_links(base_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links = [
+        urljoin(base_url, anchor.get("href", "").strip())
+        for anchor in soup.select('a[href*="/pages/recette-"]')
+        if anchor.get("href", "").strip()
+    ]
+    return _deduplicate_preserve_order(links)
+
+
+def find_visitwallonia_links(base_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+
+    for anchor in soup.select('a[href^="/node/"], a[href*="/content/recette-de-cuisine-"]'):
+        href = anchor.get("href", "").strip()
+        if not href:
+            continue
+        links.append(urljoin(base_url, href))
+
+    return _deduplicate_preserve_order(links)
+
+
+def _recipe_from_ld_json(url: str, payload: dict[str, Any], site_name: str) -> Recipe | None:
     title = _text(payload.get("name"))
     ingredients = _normalize_strings(payload.get("recipeIngredient"))
     instructions = _normalize_instructions(payload.get("recipeInstructions"))
@@ -45,7 +213,13 @@ def _recipe_from_ld_json(url: str, payload: dict[str, Any]) -> Recipe | None:
 
     image = payload.get("image")
     if isinstance(image, list):
-        image_text = _text(image[0]) if image else None
+        first_image = image[0] if image else None
+        if isinstance(first_image, dict):
+            image_text = _text(first_image.get("url")) or _text(first_image.get("@id"))
+        else:
+            image_text = _text(first_image)
+    elif isinstance(image, dict):
+        image_text = _text(image.get("url")) or _text(image.get("@id"))
     else:
         image_text = _text(image)
 
@@ -58,11 +232,157 @@ def _recipe_from_ld_json(url: str, payload: dict[str, Any]) -> Recipe | None:
         total_time=_duration_to_minutes(payload.get("totalTime")),
         prep_time=_duration_to_minutes(payload.get("prepTime")),
         cook_time=_duration_to_minutes(payload.get("cookTime")),
-        image=image_text,
+        image=_normalize_image_url(url, image_text),
         ingredients=ingredients,
         instructions=[step for step in instructions if step],
-        site_name="colruyt.be",
+        site_name=site_name,
     )
+
+
+def extract_equifrais_recipe(url: str, html: str) -> Recipe | None:
+    soup = BeautifulSoup(html, "html.parser")
+    title_node = soup.select_one("h1.text-script")
+    title = _text(title_node.get_text(" ", strip=True)) if title_node else None
+
+    ingredient_section = soup.find("h6", string=lambda value: value and "Ingrédients" in value)
+    ingredients = _extract_list_after_heading(ingredient_section)
+
+    prep_card = None
+    for card in soup.select(".card"):
+        card_text = " ".join(card.get_text(" ", strip=True).split())
+        if "Préparation" in card_text:
+            prep_card = card_text
+            break
+
+    prep_time = _extract_equifrais_prep_time(prep_card or "")
+    image = _extract_equifrais_image(html)
+
+    if not title or not ingredients:
+        return None
+
+    return Recipe(
+        title=title,
+        source_url=url,
+        prep_time=prep_time,
+        total_time=prep_time,
+        image=image,
+        ingredients=ingredients,
+        instructions=[],
+        site_name="equifrais.be",
+    )
+
+
+def find_equifrais_links(base_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+    for anchor in soup.select("a.meal-li[href]"):
+        href = anchor.get("href", "").strip()
+        if href:
+            links.append(urljoin(base_url, href))
+    return _deduplicate_preserve_order(links)
+
+
+def _extract_visitwallonia_description(article: Any) -> str | None:
+    node = article.select_one(".field-item.even > p strong")
+    if node is None:
+        return None
+    return _text(node.get_text(" ", strip=True))
+
+
+def _extract_visitwallonia_meta(article: Any) -> tuple[int | None, str | None]:
+    node = article.find(string=lambda value: value and "Préparation" in value)
+    if node is None:
+        text = article.get_text(" ", strip=True)
+    else:
+        paragraph = node.find_parent("p") if hasattr(node, "find_parent") else None
+        source = paragraph or getattr(node, "parent", None)
+        text = source.get_text(" ", strip=True) if source is not None else str(node)
+
+    prep_match = re.search(r"Préparation\s*:\s*(\d+)", text)
+    yields_match = re.search(r"(\d+)\s*(?:parts?|personnes|portions?)", text, re.IGNORECASE)
+
+    prep_time = int(prep_match.group(1)) if prep_match else None
+    yields = f"{yields_match.group(1)} parts" if yields_match else None
+    return prep_time, yields
+
+
+def _extract_visitwallonia_list(article: Any, heading_label: str, list_tag: str) -> list[str]:
+    heading = article.find(
+        lambda tag: tag.name == "h2" and heading_label.lower() in tag.get_text(" ", strip=True).lower()
+    )
+    if heading is None:
+        return []
+
+    for sibling in heading.next_siblings:
+        if not hasattr(sibling, "name"):
+            continue
+        if sibling.name == list_tag:
+            items = [
+                _text(" ".join(item.get_text(" ", strip=True).split()))
+                for item in sibling.select("li")
+            ]
+            return [item for item in items if item]
+        if sibling.name == "h2":
+            break
+    return []
+
+
+def _extract_katie_title(soup: BeautifulSoup) -> str | None:
+    for heading in soup.select("h1"):
+        text = _text(heading.get_text(" ", strip=True))
+        if text and text.lower() != "katie parla":
+            return text
+
+    title = _extract_meta_content(soup, "property", "og:title")
+    if title:
+        return re.sub(r"\s*\|\s*Katie Parla\s*$", "", title).strip()
+    return None
+
+
+def _extract_article_payload(soup: BeautifulSoup) -> dict[str, Any] | None:
+    for script in soup.select('script[type="application/ld+json"]'):
+        payload = _load_json(script.string or script.get_text())
+        if not payload:
+            continue
+        article = _find_article_payload(payload)
+        if article is not None:
+            return article
+    return None
+
+
+def _find_article_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        payload_type = payload.get("@type")
+        if isinstance(payload_type, list) and (
+            "Article" in payload_type or "BlogPosting" in payload_type
+        ):
+            return payload
+        if payload_type in {"Article", "BlogPosting"}:
+            return payload
+        for value in payload.values():
+            article = _find_article_payload(value)
+            if article is not None:
+                return article
+    if isinstance(payload, list):
+        for item in payload:
+            article = _find_article_payload(item)
+            if article is not None:
+                return article
+    return None
+
+
+def _extract_meta_content(soup: BeautifulSoup, attr: str, value: str) -> str | None:
+    node = soup.find("meta", attrs={attr: value})
+    if node is None:
+        return None
+    return _text(node.get("content"))
+
+
+def _clean_katie_text(value: str | None) -> str | None:
+    text = _text(value)
+    if text is None:
+        return None
+    return " ".join(text.split())
 
 
 def _find_recipe_payload(payload: Any) -> dict[str, Any] | None:
@@ -126,6 +446,24 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+def _normalize_image_url(page_url: str, image_url: str | None) -> str | None:
+    image_text = _text(image_url)
+    if image_text is None:
+        return None
+    if image_text.startswith("//"):
+        return f"https:{image_text}"
+    if "/www.sofiedumont.fr/cdn/" in image_text:
+        return "https://www.sofiedumont.fr/" + image_text.split(
+            "/www.sofiedumont.fr/", maxsplit=1
+        )[1].lstrip("/")
+    if image_text.startswith("www.sofiedumont.fr/"):
+        return f"https://{image_text}"
+
+    if image_text.startswith("http://") or image_text.startswith("https://"):
+        return image_text
+    return urljoin(page_url, image_text)
+
+
 def _duration_to_minutes(value: Any) -> int | None:
     if not value or not isinstance(value, str):
         return None
@@ -141,3 +479,50 @@ def _duration_to_minutes(value: Any) -> int | None:
         minute_part = raw.split("M", maxsplit=1)[0]
         minutes = int(minute_part or 0)
     return hours * 60 + minutes
+
+
+def _extract_list_after_heading(heading_node: Any) -> list[str]:
+    if heading_node is None:
+        return []
+    card = heading_node.find_parent(class_="card")
+    if card is None:
+        return []
+    items = []
+    for item in card.select("ul li"):
+        text = item.get_text(" ", strip=True)
+        if text:
+            items.append(text)
+    return items
+
+
+def _extract_equifrais_prep_time(text: str) -> int | None:
+    match = re.search(r"(\d+)\s*-\s*(\d+)'", text)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        return round((start + end) / 2)
+    match = re.search(r"(\d+)'", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_equifrais_image(html: str) -> str | None:
+    match = re.search(
+        r"background-image:\s*url\((https://www\.equifrais\.be/images/i_elements/meals/[^)]+)\)",
+        html,
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def _deduplicate_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique

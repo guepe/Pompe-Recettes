@@ -33,6 +33,11 @@ Those sites are handled in [`src/pompe_recettes/site_overrides.py`](./src/pompe_
 Currently handled locally:
 
 - `colruyt.be`
+- `equifrais.be`
+- `sofiedumont.fr`
+- `visitwallonia.be`
+- `giallozafferano.com`
+- `katieparla.com`
 
 ## How Support Works
 

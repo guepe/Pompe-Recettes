@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -22,7 +25,19 @@ from pompe_recettes.notion_export import (
     extract_notion_id,
 )
 from pompe_recettes.project_config import DEFAULT_PROJECT_CONFIG_PATH, load_project_config
-from pompe_recettes.site_overrides import extract_site_recipe
+from pompe_recettes.site_overrides import extract_site_recipe, find_site_candidate_links
+
+
+@dataclass(slots=True)
+class NotionSyncPlan:
+    parent_type: str
+    parent_id: str
+    schema_properties: dict[str, Any]
+    include_markdown_block: bool
+    use_recipe_image_as_cover: bool
+    exporter: Any
+    existing_pages: list[dict[str, Any]]
+    missing_recipes: list[Recipe]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Nombre maximum de recettes a retourner lors du crawling.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Nombre de pages a recuperer en parallele pendant le crawl.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=None,
+        help="Timeout reseau par page, en secondes.",
+    )
+    parser.add_argument(
         "--translate-fr",
         action="store_true",
         default=None,
@@ -73,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="translate_fr",
         action="store_false",
         help="Garde le texte source sans traduction francaise.",
+    )
+    parser.add_argument(
+        "--translate-mode",
+        choices=("off", "auto", "force"),
+        default=None,
+        help="Controle la traduction: off, auto ou force.",
     )
     parser.add_argument(
         "--output-dir",
@@ -114,9 +147,11 @@ def main() -> int:
 
     max_pages = args.max_pages if args.max_pages is not None else run_config.max_pages
     max_recipes = args.max_recipes if args.max_recipes is not None else run_config.max_recipes
-    translate_fr = (
-        args.translate_fr if args.translate_fr is not None else run_config.translate_fr
+    crawl_workers = args.workers if args.workers is not None else run_config.crawl_workers
+    request_timeout = (
+        args.request_timeout if args.request_timeout is not None else run_config.request_timeout
     )
+    translate_mode = _resolve_translate_mode(args, run_config)
     push_notion = args.push_notion if args.push_notion is not None else run_config.push_notion
     output = args.output if args.output is not None else run_config.output
     output_dir = args.output_dir if args.output_dir is not None else run_config.output_dir
@@ -128,10 +163,14 @@ def main() -> int:
             url,
             max_pages=max(1, max_pages),
             max_recipes=max(1, max_recipes),
+            crawl_workers=max(1, crawl_workers),
+            request_timeout=max(1, request_timeout),
+            progress_callback=_make_progress_callback(max(1, max_pages), max(1, max_recipes)),
         )
     except Exception as exc:  # pragma: no cover
         print(f"Erreur: impossible d'extraire la recette: {exc}", file=sys.stderr)
         return 1
+    _finish_progress()
     if not recipes:
         print(
             "Erreur: aucune recette exploitable trouvee a partir de cette URL.",
@@ -139,18 +178,42 @@ def main() -> int:
         )
         return 1
 
-    if translate_fr:
-        recipes = [localize_recipe(recipe, translate_to_french=True) for recipe in recipes]
+    recipes_for_output = recipes
+    push_results: list[str] = []
+    notion_sync_plan: NotionSyncPlan | None = None
+
+    if push_notion:
+        notion_sync_plan = prepare_notion_sync(recipes, Path(notion_config_path))
+        _print_status(
+            (
+                f"Notion : {len(notion_sync_plan.existing_pages)} déjà présente(s), "
+                f"{len(notion_sync_plan.missing_recipes)} à créer"
+            )
+        )
+
+        recipes_to_push = notion_sync_plan.missing_recipes
+        if translate_mode != "off" and recipes_to_push:
+            _print_status(_build_translation_status(recipes_to_push, translate_mode))
+            recipes_to_push = _localize_recipes_with_progress(recipes_to_push, translate_mode)
+            _finish_progress()
+
+        push_results = push_prepared_recipes_to_notion(recipes_to_push, notion_sync_plan)
+    elif translate_mode != "off":
+        _print_status(_build_translation_status(recipes, translate_mode))
+        recipes_for_output = _localize_recipes_with_progress(recipes, translate_mode)
+        _finish_progress()
 
     if emit_json:
         payload: Any
-        if len(recipes) == 1:
-            payload = recipe_to_dict(recipes[0])
+        if len(recipes_for_output) == 1:
+            payload = recipe_to_dict(recipes_for_output[0])
         else:
-            payload = [recipe_to_dict(recipe) for recipe in recipes]
+            payload = [recipe_to_dict(recipe) for recipe in recipes_for_output]
         content = json.dumps(payload, ensure_ascii=False, indent=2)
+    elif output or output_dir:
+        content = render_recipes_markdown(recipes_for_output)
     else:
-        content = render_recipes_markdown(recipes)
+        content = ""
 
     if output and output_dir:
         print(
@@ -160,45 +223,90 @@ def main() -> int:
         return 1
 
     if output_dir:
-        write_recipe_files(recipes, Path(output_dir))
+        write_recipe_files(recipes_for_output, Path(output_dir))
+        print(f"{len(recipes_for_output)} recette(s) écrite(s) dans {output_dir}")
     elif output:
         with open(output, "w", encoding="utf-8") as handle:
             handle.write(content)
-    else:
+        print(f"{len(recipes_for_output)} recette(s) écrite(s) dans {output}")
+    elif emit_json:
         print(content, end="" if content.endswith("\n") else "\n")
+    else:
+        print(render_recipe_summary(recipes_for_output))
 
     if push_notion:
-        push_results = push_recipes_to_notion(recipes, Path(notion_config_path))
-        for result in push_results:
-            print(f"Notion: {result}")
+        print(render_notion_summary(push_results))
 
     return 0
 
 
-def collect_recipes(url: str, max_pages: int, max_recipes: int) -> list[Recipe]:
+def collect_recipes(
+    url: str,
+    max_pages: int,
+    max_recipes: int,
+    crawl_workers: int = 4,
+    request_timeout: int = 10,
+    progress_callback: Callable[[int, int, int], None] | None = None,
+) -> list[Recipe]:
     recipes: list[Recipe] = []
     seen_urls: set[str] = set()
     queued_urls: set[str] = {url}
     queue: deque[str] = deque([url])
     origin = urlparse(url)
+    crawled_pages = 0
 
-    while queue and len(seen_urls) < max_pages and len(recipes) < max_recipes:
-        current_url = queue.popleft()
-        queued_urls.discard(current_url)
-        if current_url in seen_urls:
-            continue
+    if progress_callback is not None:
+        progress_callback(crawled_pages, len(recipes), len(queue))
 
-        seen_urls.add(current_url)
-        html = fetch_html(current_url)
-        recipe = extract_recipe(current_url, html)
-        if recipe is not None:
-            recipes.append(recipe)
-            continue
+    with ThreadPoolExecutor(max_workers=max(1, crawl_workers)) as executor:
+        while queue and crawled_pages <= max_pages and len(recipes) < max_recipes:
+            batch: list[str] = []
 
-        for link in find_candidate_links(current_url, html, origin.netloc):
-            if link not in seen_urls and link not in queued_urls:
-                queue.append(link)
-                queued_urls.add(link)
+            while queue and len(batch) < max(1, crawl_workers):
+                current_url = queue.popleft()
+                queued_urls.discard(current_url)
+                if current_url in seen_urls:
+                    continue
+                seen_urls.add(current_url)
+                batch.append(current_url)
+
+            if not batch:
+                break
+
+            futures = {
+                executor.submit(fetch_html, current_url, request_timeout): current_url
+                for current_url in batch
+            }
+
+            for future in as_completed(futures):
+                current_url = futures[future]
+
+                try:
+                    html = future.result()
+                except Exception:
+                    crawled_pages += 1
+                    if progress_callback is not None:
+                        progress_callback(crawled_pages, len(recipes), len(queue))
+                    continue
+
+                recipe = extract_recipe(current_url, html)
+                if recipe is not None:
+                    recipes.append(recipe)
+                    if progress_callback is not None:
+                        progress_callback(crawled_pages, len(recipes), len(queue))
+                    if len(recipes) >= max_recipes:
+                        break
+                    continue
+
+                crawled_pages += 1
+
+                for link in find_candidate_links(current_url, html, origin.netloc):
+                    if link not in seen_urls and link not in queued_urls:
+                        queue.append(link)
+                        queued_urls.add(link)
+
+                if progress_callback is not None:
+                    progress_callback(crawled_pages, len(recipes), len(queue))
 
     return recipes
 
@@ -251,6 +359,10 @@ def is_viable_recipe(recipe: Recipe) -> bool:
 
 
 def find_candidate_links(base_url: str, html: str, allowed_host: str) -> list[str]:
+    override_links = find_site_candidate_links(base_url, html)
+    if override_links:
+        return override_links
+
     soup = BeautifulSoup(html, "html.parser")
     links: list[str] = []
 
@@ -284,6 +396,19 @@ def render_recipes_markdown(recipes: list[Recipe]) -> str:
     return "\n\n---\n\n".join(parts) + "\n"
 
 
+def render_recipe_summary(recipes: list[Recipe]) -> str:
+    lines = [f"{len(recipes)} recette(s) trouvée(s) :"]
+    for index, recipe in enumerate(recipes, start=1):
+        meta: list[str] = []
+        if recipe.site_name:
+            meta.append(recipe.site_name)
+        if recipe.total_time is not None:
+            meta.append(f"{recipe.total_time} min")
+        suffix = f" ({' • '.join(meta)})" if meta else ""
+        lines.append(f"{index}. {recipe.title}{suffix}")
+    return "\n".join(lines)
+
+
 def write_recipe_files(recipes: list[Recipe], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     written_names: set[str] = set()
@@ -297,25 +422,158 @@ def write_recipe_files(recipes: list[Recipe], output_dir: Path) -> None:
 
 
 def push_recipes_to_notion(recipes: list[Recipe], config_path: Path) -> list[str]:
+    plan = prepare_notion_sync(recipes, config_path)
+    return push_prepared_recipes_to_notion(plan.missing_recipes, plan)
+
+
+def prepare_notion_sync(recipes: list[Recipe], config_path: Path) -> NotionSyncPlan:
     config, exporter = build_exporter_from_config(config_path)
     parent_type, parent_id, schema_properties = exporter.resolve_parent(
         data_source_id=config.data_source_id,
         database_id=_resolve_database_id(config),
     )
+    existing_pages: list[dict[str, Any]] = []
+    missing_recipes: list[Recipe] = []
+
+    for recipe in recipes:
+        existing_page = exporter.find_existing_recipe_page(
+            parent_type=parent_type,
+            parent_id=parent_id,
+            recipe=recipe,
+            schema_properties=schema_properties,
+        )
+        if existing_page is not None:
+            existing_pages.append(existing_page)
+        else:
+            missing_recipes.append(recipe)
+
+    return NotionSyncPlan(
+        parent_type=parent_type,
+        parent_id=parent_id,
+        schema_properties=schema_properties,
+        include_markdown_block=config.include_markdown_block,
+        use_recipe_image_as_cover=config.use_recipe_image_as_cover,
+        exporter=exporter,
+        existing_pages=existing_pages,
+        missing_recipes=missing_recipes,
+    )
+
+
+def push_prepared_recipes_to_notion(
+    recipes: list[Recipe],
+    plan: NotionSyncPlan,
+) -> list[str]:
     page_urls: list[str] = []
 
     for recipe in recipes:
-        page = exporter.export_recipe(
-            parent_id=parent_id,
+        page = plan.exporter.export_recipe(
+            parent_id=plan.parent_id,
             recipe=recipe,
-            include_markdown_block=config.include_markdown_block,
-            parent_type=parent_type,
-            schema_properties=schema_properties,
-            use_recipe_image_as_cover=config.use_recipe_image_as_cover,
+            include_markdown_block=plan.include_markdown_block,
+            parent_type=plan.parent_type,
+            schema_properties=plan.schema_properties,
+            use_recipe_image_as_cover=plan.use_recipe_image_as_cover,
         )
         page_urls.append(page.get("url", page.get("id", "page créée")))
 
     return page_urls
+
+
+def _resolve_translate_mode(args: argparse.Namespace, run_config: Any) -> str:
+    if args.translate_mode is not None:
+        return args.translate_mode
+    if args.translate_fr is not None:
+        return "auto" if args.translate_fr else "off"
+    mode = getattr(run_config, "translate_mode", "")
+    if mode in {"off", "auto", "force"}:
+        return mode
+    return "auto" if getattr(run_config, "translate_fr", True) else "off"
+
+
+def _build_translation_status(recipes: list[Recipe], translate_mode: str) -> str:
+    if translate_mode == "force":
+        return f"Traduction : mode force sur {len(recipes)} recette(s)"
+
+    translatable_count = sum(1 for recipe in recipes if recipe.site_name not in {"colruyt.be", "equifrais.be", "sofiedumont.fr", "visitwallonia.be"})
+    skipped_count = len(recipes) - translatable_count
+    if skipped_count and translatable_count:
+        return (
+            f"Traduction : {translatable_count} recette(s) a traduire, "
+            f"{skipped_count} deja en francais"
+        )
+    if skipped_count:
+        return f"Traduction : bypass, {skipped_count} recette(s) deja en francais"
+    return f"Traduction : {len(recipes)} recette(s) a traduire"
+
+
+def _print_status(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def render_notion_summary(page_urls: list[str]) -> str:
+    lines = [f"Notion : {len(page_urls)} page(s) créée(s)"]
+    for index, page_url in enumerate(page_urls, start=1):
+        lines.append(f"{index}. {page_url}")
+    return "\n".join(lines)
+
+
+def _localize_recipes_with_progress(recipes: list[Recipe], translate_mode: str) -> list[Recipe]:
+    localized_recipes: list[Recipe] = []
+    total = len(recipes)
+
+    for index, recipe in enumerate(recipes, start=1):
+        _print_translation_progress(index - 1, total, recipe.title)
+        localized_recipes.append(
+            localize_recipe(
+                recipe,
+                translate_to_french=True,
+                force_translation=(translate_mode == "force"),
+            )
+        )
+        _print_translation_progress(index, total, recipe.title)
+
+    return localized_recipes
+
+
+def _make_progress_callback(
+    max_pages: int, max_recipes: int
+) -> Callable[[int, int, int], None]:
+    def callback(crawled_pages: int, found_recipes: int, queued_urls: int) -> None:
+        width = 18
+        progress = 0.0
+        if max_recipes > 0:
+            progress = min(1.0, found_recipes / max_recipes)
+        filled = round(progress * width)
+        bar = "#" * filled + "-" * (width - filled)
+        print(
+            (
+                f"\r[{bar}] recettes {found_recipes}/{max_recipes} "
+                f"| crawl {crawled_pages}/{max_pages} | file {queued_urls}"
+            ),
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return callback
+
+
+def _finish_progress() -> None:
+    print(file=sys.stderr)
+
+
+def _print_translation_progress(done: int, total: int, title: str) -> None:
+    width = 18
+    progress = 0.0 if total <= 0 else min(1.0, done / total)
+    filled = round(progress * width)
+    bar = "#" * filled + "-" * (width - filled)
+    label = title.strip()[:50]
+    print(
+        f"\r[{bar}] traduction {done}/{total} | {label}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _resolve_database_id(config: Any) -> str:

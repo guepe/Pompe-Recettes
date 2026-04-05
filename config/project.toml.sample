@@ -2,6 +2,8 @@
 url = ""
 max_pages = 12
 max_recipes = 3
+crawl_workers = 4
+request_timeout = 10
 translate_fr = true
 push_notion = true
 output = ""
