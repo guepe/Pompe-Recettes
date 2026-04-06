@@ -29,6 +29,8 @@ def extract_site_recipe(url: str, html: str) -> Recipe | None:
 
 def find_site_candidate_links(url: str, html: str) -> list[str]:
     host = urlparse(url).netloc.replace("www.", "")
+    if host == "giallozafferano.com":
+        return find_giallozafferano_links(url, html)
     if host == "sofiedumont.fr":
         return find_sofiedumont_links(url, html)
     if host == "visitwallonia.be":
@@ -48,6 +50,39 @@ def extract_sofiedumont_recipe(url: str, html: str) -> Recipe | None:
 
 def extract_giallozafferano_recipe(url: str, html: str) -> Recipe | None:
     return extract_recipe_from_ld_json(url, html, site_name="giallozafferano.com")
+
+
+def find_giallozafferano_links(base_url: str, html: str) -> list[str]:
+    parsed = urlparse(base_url)
+    if "/recipes-list/" not in parsed.path:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    item_list_links = _extract_item_list_links(soup, base_url)
+    pagination_links = _extract_same_listing_pagination_links(soup, base_url)
+
+    if item_list_links:
+        return _deduplicate_preserve_order(item_list_links + pagination_links)
+
+    # Fallback for listing pages without usable ItemList schema.
+    listing_root = _giallo_listing_root(parsed.path)
+    links: list[str] = []
+    for anchor in soup.select('a[href*="/recipes/"], a[href*="/recipes-list/"]'):
+        href = anchor.get("href", "").strip()
+        if not href:
+            continue
+        absolute_url = urljoin(base_url, href)
+        absolute_parsed = urlparse(absolute_url)
+        if absolute_parsed.netloc != parsed.netloc:
+            continue
+        normalized = absolute_parsed._replace(query="", fragment="").geturl()
+        if absolute_parsed.path.startswith("/recipes/"):
+            links.append(normalized)
+            continue
+        if _is_same_giallo_listing_page(absolute_parsed.path, listing_root):
+            links.append(normalized)
+
+    return _deduplicate_preserve_order(links)
 
 
 def extract_recipe_from_ld_json(url: str, html: str, site_name: str) -> Recipe | None:
@@ -348,6 +383,95 @@ def _extract_article_payload(soup: BeautifulSoup) -> dict[str, Any] | None:
         if article is not None:
             return article
     return None
+
+
+def _extract_item_list_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+    links: list[str] = []
+    for script in soup.select('script[type="application/ld+json"]'):
+        payload = _load_json(script.string or script.get_text())
+        links.extend(_find_item_list_links(payload, base_url))
+    return _deduplicate_preserve_order(links)
+
+
+def _find_item_list_links(payload: Any, base_url: str) -> list[str]:
+    if isinstance(payload, dict):
+        payload_type = payload.get("@type")
+        if payload_type == "ItemList" or (
+            isinstance(payload_type, list) and "ItemList" in payload_type
+        ):
+            return _extract_urls_from_item_list(payload, base_url)
+        links: list[str] = []
+        for value in payload.values():
+            links.extend(_find_item_list_links(value, base_url))
+        return links
+    if isinstance(payload, list):
+        links: list[str] = []
+        for item in payload:
+            links.extend(_find_item_list_links(item, base_url))
+        return links
+    return []
+
+
+def _extract_urls_from_item_list(payload: dict[str, Any], base_url: str) -> list[str]:
+    items = payload.get("itemListElement")
+    if not isinstance(items, list):
+        return []
+
+    links: list[str] = []
+    for item in items:
+        url = None
+        if isinstance(item, dict):
+            nested_item = item.get("item")
+            if isinstance(nested_item, dict):
+                url = _text(nested_item.get("@id")) or _text(nested_item.get("url"))
+            else:
+                url = _text(nested_item)
+            url = url or _text(item.get("url"))
+        else:
+            url = _text(item)
+
+        if not url:
+            continue
+        absolute_url = urljoin(base_url, url)
+        parsed = urlparse(absolute_url)
+        if parsed.path.startswith("/recipes/"):
+            links.append(parsed._replace(query="", fragment="").geturl())
+
+    return links
+
+
+def _extract_same_listing_pagination_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+    parsed = urlparse(base_url)
+    listing_root = _giallo_listing_root(parsed.path)
+    links: list[str] = []
+
+    for anchor in soup.select('a[href*="/recipes-list/"]'):
+        href = anchor.get("href", "").strip()
+        if not href:
+            continue
+        absolute_url = urljoin(base_url, href)
+        absolute_parsed = urlparse(absolute_url)
+        if absolute_parsed.netloc != parsed.netloc:
+            continue
+        if _is_same_giallo_listing_page(absolute_parsed.path, listing_root):
+            links.append(absolute_parsed._replace(query="", fragment="").geturl())
+
+    return _deduplicate_preserve_order(links)
+
+
+def _giallo_listing_root(path: str) -> str:
+    normalized_path = path.rstrip("/")
+    page_match = re.match(r"^(.*?/recipes-list/[^/]+)/page\d+$", normalized_path)
+    if page_match:
+        return page_match.group(1)
+    return normalized_path
+
+
+def _is_same_giallo_listing_page(path: str, listing_root: str) -> bool:
+    normalized_path = path.rstrip("/")
+    if normalized_path == listing_root:
+        return True
+    return bool(re.match(rf"^{re.escape(listing_root)}/page\d+$", normalized_path))
 
 
 def _find_article_payload(payload: Any) -> dict[str, Any] | None:

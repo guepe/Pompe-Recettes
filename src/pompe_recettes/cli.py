@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
@@ -15,6 +16,7 @@ from bs4 import BeautifulSoup
 from recipe_scrapers._exceptions import WebsiteNotImplementedError
 from recipe_scrapers import scrape_html
 
+from pompe_recettes.crawl_progress import CrawlCheckpoint, CrawlProgressStore
 from pompe_recettes.fetcher import fetch_html
 from pompe_recettes.localize import localize_recipe
 from pompe_recettes.markdown import recipe_filename, render_markdown
@@ -90,6 +92,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Timeout reseau par page, en secondes.",
     )
     parser.add_argument(
+        "--resume-crawl",
+        action="store_true",
+        default=None,
+        help="Reprend la progression de crawl deja enregistree pour cette URL de depart.",
+    )
+    parser.add_argument(
+        "--no-resume-crawl",
+        dest="resume_crawl",
+        action="store_false",
+        help="Ignore la progression enregistree et repart du debut.",
+    )
+    parser.add_argument(
+        "--crawl-progress-path",
+        default=None,
+        help="Chemin du fichier JSON qui stocke la progression de crawl.",
+    )
+    parser.add_argument(
         "--translate-fr",
         action="store_true",
         default=None,
@@ -151,6 +170,12 @@ def main() -> int:
     request_timeout = (
         args.request_timeout if args.request_timeout is not None else run_config.request_timeout
     )
+    resume_crawl = args.resume_crawl if args.resume_crawl is not None else run_config.resume_crawl
+    crawl_progress_path = (
+        args.crawl_progress_path
+        if args.crawl_progress_path is not None
+        else run_config.crawl_progress_path
+    )
     translate_mode = _resolve_translate_mode(args, run_config)
     push_notion = args.push_notion if args.push_notion is not None else run_config.push_notion
     output = args.output if args.output is not None else run_config.output
@@ -165,6 +190,8 @@ def main() -> int:
             max_recipes=max(1, max_recipes),
             crawl_workers=max(1, crawl_workers),
             request_timeout=max(1, request_timeout),
+            resume_crawl=resume_crawl,
+            crawl_progress_path=crawl_progress_path,
             progress_callback=_make_progress_callback(max(1, max_pages), max(1, max_recipes)),
         )
     except Exception as exc:  # pragma: no cover
@@ -246,20 +273,57 @@ def collect_recipes(
     max_recipes: int,
     crawl_workers: int = 4,
     request_timeout: int = 10,
+    resume_crawl: bool = True,
+    crawl_progress_path: str | Path = ".cache/pompe-recettes/crawl-progress.json",
     progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> list[Recipe]:
+    normalized_start_url = _normalize_url(url)
+    progress_store = (
+        CrawlProgressStore(crawl_progress_path) if resume_crawl and crawl_progress_path else None
+    )
+    checkpoint = (
+        progress_store.load(normalized_start_url)
+        if progress_store is not None
+        else CrawlCheckpoint(start_url=normalized_start_url)
+    )
+    if checkpoint is None:
+        checkpoint = CrawlCheckpoint(start_url=normalized_start_url)
+
+    recipes_by_url = {
+        recipe.source_url: recipe
+        for recipe in (
+            progress_store.load_recipes(normalized_start_url) if progress_store is not None else []
+        )
+        if recipe.source_url
+    }
+    already_served = max(0, checkpoint.served_recipes)
+    target_recipe_count = already_served + max_recipes
     recipes: list[Recipe] = []
-    seen_urls: set[str] = set()
-    queued_urls: set[str] = {url}
-    queue: deque[str] = deque([url])
+    seen_urls: set[str] = set(checkpoint.seen_urls)
+    queued_urls: set[str] = set(checkpoint.queue)
+    queue: deque[str] = deque(_prioritize_resume_queue(normalized_start_url, checkpoint.queue))
+    if not queue and normalized_start_url not in seen_urls:
+        queue.append(normalized_start_url)
+        queued_urls.add(normalized_start_url)
     origin = urlparse(url)
-    crawled_pages = 0
+    crawled_pages = checkpoint.crawled_pages
 
     if progress_callback is not None:
-        progress_callback(crawled_pages, len(recipes), len(queue))
+        progress_callback(
+            crawled_pages,
+            _current_batch_size(recipes_by_url, already_served, max_recipes),
+            len(queue),
+        )
+
+    if len(recipes_by_url) >= target_recipe_count:
+        recipes = _select_recipe_batch(recipes_by_url, already_served, max_recipes)
+        checkpoint.served_recipes = already_served + len(recipes)
+        if progress_store is not None:
+            progress_store.save(checkpoint)
+        return recipes
 
     with ThreadPoolExecutor(max_workers=max(1, crawl_workers)) as executor:
-        while queue and crawled_pages <= max_pages and len(recipes) < max_recipes:
+        while queue and crawled_pages <= max_pages and len(recipes_by_url) < target_recipe_count:
             batch: list[str] = []
 
             while queue and len(batch) < max(1, crawl_workers):
@@ -285,16 +349,42 @@ def collect_recipes(
                     html = future.result()
                 except Exception:
                     crawled_pages += 1
+                    _save_crawl_checkpoint(
+                        progress_store,
+                        checkpoint,
+                        seen_urls=seen_urls,
+                        queue=queue,
+                        recipes_by_url=recipes_by_url,
+                        crawled_pages=crawled_pages,
+                    )
                     if progress_callback is not None:
-                        progress_callback(crawled_pages, len(recipes), len(queue))
+                        progress_callback(
+                            crawled_pages,
+                            _current_batch_size(recipes_by_url, already_served, max_recipes),
+                            len(queue),
+                        )
                     continue
 
                 recipe = extract_recipe(current_url, html)
                 if recipe is not None:
-                    recipes.append(recipe)
+                    recipe.source_url = _normalize_url(recipe.source_url)
+                    if recipe.source_url not in recipes_by_url:
+                        recipes_by_url[recipe.source_url] = recipe
+                    _save_crawl_checkpoint(
+                        progress_store,
+                        checkpoint,
+                        seen_urls=seen_urls,
+                        queue=queue,
+                        recipes_by_url=recipes_by_url,
+                        crawled_pages=crawled_pages,
+                    )
                     if progress_callback is not None:
-                        progress_callback(crawled_pages, len(recipes), len(queue))
-                    if len(recipes) >= max_recipes:
+                        progress_callback(
+                            crawled_pages,
+                            _current_batch_size(recipes_by_url, already_served, max_recipes),
+                            len(queue),
+                        )
+                    if len(recipes_by_url) >= target_recipe_count:
                         break
                     continue
 
@@ -305,9 +395,26 @@ def collect_recipes(
                         queue.append(link)
                         queued_urls.add(link)
 
-                if progress_callback is not None:
-                    progress_callback(crawled_pages, len(recipes), len(queue))
+                _save_crawl_checkpoint(
+                    progress_store,
+                    checkpoint,
+                    seen_urls=seen_urls,
+                    queue=queue,
+                    recipes_by_url=recipes_by_url,
+                    crawled_pages=crawled_pages,
+                )
 
+                if progress_callback is not None:
+                    progress_callback(
+                        crawled_pages,
+                        _current_batch_size(recipes_by_url, already_served, max_recipes),
+                        len(queue),
+                    )
+
+    recipes = _select_recipe_batch(recipes_by_url, already_served, max_recipes)
+    checkpoint.served_recipes = already_served + len(recipes)
+    if progress_store is not None:
+        progress_store.save(checkpoint)
     return recipes
 
 
@@ -515,6 +622,91 @@ def render_notion_summary(page_urls: list[str]) -> str:
     for index, page_url in enumerate(page_urls, start=1):
         lines.append(f"{index}. {page_url}")
     return "\n".join(lines)
+
+
+def _save_crawl_checkpoint(
+    progress_store: CrawlProgressStore | None,
+    checkpoint: CrawlCheckpoint,
+    *,
+    seen_urls: set[str],
+    queue: deque[str],
+    recipes_by_url: dict[str, Recipe],
+    crawled_pages: int,
+) -> None:
+    checkpoint.seen_urls = list(seen_urls)
+    checkpoint.queue = list(queue)
+    checkpoint.recipe_urls = list(recipes_by_url)
+    checkpoint.recipes = [
+        recipe_to_dict(stored_recipe) for stored_recipe in list(recipes_by_url.values())
+    ]
+    checkpoint.crawled_pages = crawled_pages
+    if progress_store is not None:
+        progress_store.save(checkpoint)
+
+
+def _prioritize_resume_queue(start_url: str, queue: list[str]) -> list[str]:
+    parsed_start = urlparse(start_url)
+    host = parsed_start.netloc.replace("www.", "")
+    if host != "giallozafferano.com" or "/recipes-list/" not in parsed_start.path:
+        return queue
+
+    listing_root = _giallo_listing_root(parsed_start.path)
+    same_listing_pages: list[tuple[int, str]] = []
+    recipe_pages: list[str] = []
+    other_pages: list[str] = []
+
+    for index, candidate in enumerate(queue):
+        parsed_candidate = urlparse(candidate)
+        candidate_path = parsed_candidate.path.rstrip("/")
+        if parsed_candidate.netloc != parsed_start.netloc:
+            other_pages.append(candidate)
+            continue
+        if _is_same_giallo_listing_page(candidate_path, listing_root):
+            same_listing_pages.append((_giallo_listing_page_number(candidate_path), candidate))
+            continue
+        if candidate_path.startswith("/recipes/"):
+            recipe_pages.append(candidate)
+            continue
+        other_pages.append(candidate)
+
+    same_listing_pages.sort(key=lambda item: item[0])
+    return [url for _, url in same_listing_pages] + recipe_pages + other_pages
+
+
+def _giallo_listing_root(path: str) -> str:
+    normalized_path = path.rstrip("/")
+    page_match = re.match(r"^(.*?/recipes-list/[^/]+)/page\d+$", normalized_path)
+    if page_match:
+        return page_match.group(1)
+    return normalized_path
+
+
+def _is_same_giallo_listing_page(path: str, listing_root: str) -> bool:
+    normalized_path = path.rstrip("/")
+    if normalized_path == listing_root:
+        return True
+    return bool(re.match(rf"^{re.escape(listing_root)}/page\d+$", normalized_path))
+
+
+def _giallo_listing_page_number(path: str) -> int:
+    normalized_path = path.rstrip("/")
+    match = re.search(r"/page(\d+)$", normalized_path)
+    if match:
+        return int(match.group(1))
+    return 1
+
+
+def _select_recipe_batch(
+    recipes_by_url: dict[str, Recipe], start_index: int, batch_size: int
+) -> list[Recipe]:
+    recipes = list(recipes_by_url.values())
+    return recipes[start_index : start_index + batch_size]
+
+
+def _current_batch_size(
+    recipes_by_url: dict[str, Recipe], served_count: int, batch_size: int
+) -> int:
+    return len(_select_recipe_batch(recipes_by_url, served_count, batch_size))
 
 
 def _localize_recipes_with_progress(recipes: list[Recipe], translate_mode: str) -> list[Recipe]:

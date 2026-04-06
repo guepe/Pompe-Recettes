@@ -109,6 +109,8 @@ max_pages = 12
 max_recipes = 3
 crawl_workers = 4
 request_timeout = 10
+resume_crawl = true
+crawl_progress_path = ".cache/pompe-recettes/crawl-progress.json"
 translate_fr = true
 push_notion = true
 output = ""
@@ -143,6 +145,20 @@ Faster crawling for large hubs:
 
 ```bash
 pompe-recettes "https://www.sofiedumont.fr/pages/recettes-cuisine-belge" --workers 6 --request-timeout 8
+```
+
+Resume a large crawl instead of restarting from page 1:
+
+```bash
+pompe-recettes "https://www.sofiedumont.fr/pages/recettes-cuisine-belge" --max-recipes 100
+```
+
+With `resume_crawl = true`, repeated runs return the next batch of recipes for the same start URL instead of replaying the first saved batch.
+
+Force a fresh crawl and ignore saved progress:
+
+```bash
+pompe-recettes "https://www.sofiedumont.fr/pages/recettes-cuisine-belge" --no-resume-crawl
 ```
 
 Use another config file:

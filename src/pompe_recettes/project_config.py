@@ -15,6 +15,8 @@ class RunConfig:
     max_recipes: int = 3
     crawl_workers: int = 4
     request_timeout: int = 10
+    resume_crawl: bool = True
+    crawl_progress_path: str = ".cache/pompe-recettes/crawl-progress.json"
     translate_mode: str = "auto"
     translate_fr: bool = True
     push_notion: bool = True
@@ -50,6 +52,10 @@ def load_project_config(path: str | Path = DEFAULT_PROJECT_CONFIG_PATH) -> Proje
         max_recipes=int(run_raw.get("max_recipes", 3)),
         crawl_workers=int(run_raw.get("crawl_workers", 4)),
         request_timeout=int(run_raw.get("request_timeout", 10)),
+        resume_crawl=bool(run_raw.get("resume_crawl", True)),
+        crawl_progress_path=str(
+            run_raw.get("crawl_progress_path", ".cache/pompe-recettes/crawl-progress.json")
+        ),
         translate_mode=translate_mode,
         translate_fr=bool(run_raw.get("translate_fr", True)),
         push_notion=bool(run_raw.get("push_notion", True)),
